@@ -100,37 +100,40 @@ fn install_config(root: &Path, arch: &str) {
     println!("Installed config: {} -> .axconfig.toml", src.display());
 }
 
-/// Find the musl cross-compiler for the given prefix.
+/// Find a cross-compilation tool by trying several prefixes in order.
 /// Tries PATH first, then known fallback locations.
-fn find_tool(prefix: &str, tool: &str) -> String {
-    let name = format!("{prefix}-{tool}");
+fn find_tool(prefixes: &[&str], tool: &str) -> String {
+    for prefix in prefixes {
+        let name = format!("{prefix}-{tool}");
 
-    // Try PATH first
-    if let Ok(output) = Command::new("which").arg(&name).output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
+        // Try PATH first
+        if let Ok(output) = Command::new("which").arg(&name).output() {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return path;
+                }
+            }
+        }
+
+        // Try known fallback locations
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home".into());
+        let fallback_dirs = [
+            format!("{home}/thecodes/{prefix}-cross/bin"),
+            format!("/opt/{prefix}-cross/bin"),
+            format!("/usr/local/bin"),
+            String::from("/usr/bin"),
+        ];
+        for dir in &fallback_dirs {
+            let path = format!("{dir}/{name}");
+            if Path::new(&path).exists() {
                 return path;
             }
         }
     }
 
-    // Try known fallback locations
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home".into());
-    let fallback_dirs = [
-        format!("{home}/thecodes/{prefix}-cross/bin"),
-        format!("/opt/{prefix}-cross/bin"),
-        format!("/usr/local/bin"),
-    ];
-    for dir in &fallback_dirs {
-        let path = format!("{dir}/{name}");
-        if Path::new(&path).exists() {
-            return path;
-        }
-    }
-
-    // Last resort: just return the name and hope it's in PATH
-    name
+    // Last resort: just return the first candidate and hope it's in PATH.
+    format!("{}-{tool}", prefixes[0])
 }
 
 /// Build the user-space payload (`mapfile` from `payload/mapfile_c/mapfile.c`).
@@ -152,8 +155,10 @@ fn build_payload(root: &Path, info: &ArchInfo) -> PathBuf {
     std::fs::create_dir_all(&out_dir).unwrap();
     let mapfile_elf = out_dir.join(MAPFILE_BIN);
 
-    let gcc = find_tool(info.musl_prefix, "gcc");
-    let strip = find_tool(info.musl_prefix, "strip");
+    let gnu_prefix = info.musl_prefix.replace("-musl", "-gnu");
+    let prefixes = [info.musl_prefix, gnu_prefix.as_str()];
+    let gcc = find_tool(&prefixes, "gcc");
+    let strip = find_tool(&prefixes, "strip");
 
     println!("Building mapfile payload with {} ...", gcc);
 

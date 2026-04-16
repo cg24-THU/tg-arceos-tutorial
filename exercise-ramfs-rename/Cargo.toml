@@ -28,4 +28,8 @@ axio = { version = "0.3.0-pre.1", optional = true }
 
 clap = { version = "4", features = ["derive"], optional = true }
 
+[patch.crates-io]
+axfs = { path = "./axfs" }
+axfs_ramfs = { path = "./axfs_ramfs" }
+
 [profile.release]

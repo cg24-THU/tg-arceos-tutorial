@@ -12,6 +12,7 @@ use axfs::fops::{File, OpenOptions};
 use axhal::paging::MappingFlags;
 use axhal::uspace::UserContext;
 use axsync::Mutex;
+use memory_addr::{PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
 
 // ---- Architecture-specific syscall numbers ----
 
@@ -28,6 +29,22 @@ mod nums {
     pub const SYS_SET_TID_ADDRESS: usize = 96;
     pub const SYS_MMAP: usize = 222;
     pub const SYS_BRK: usize = 214;
+    pub const SYS_GETUID: usize = 174;
+    pub const SYS_GETEUID: usize = 175;
+    pub const SYS_GETGID: usize = 176;
+    pub const SYS_GETEGID: usize = 177;
+    pub const SYS_SET_ROBUST_LIST: usize = 99;
+    pub const SYS_UNAME: usize = 160;
+    pub const SYS_GETPID: usize = 172;
+    pub const SYS_GETTID: usize = 178;
+    pub const SYS_TGKILL: usize = 131;
+    pub const SYS_RT_SIGACTION: usize = 134;
+    pub const SYS_RT_SIGPROCMASK: usize = 135;
+    pub const SYS_CLOCK_GETTIME: usize = 113;
+    pub const SYS_MPROTECT: usize = 226;
+    pub const SYS_PRLIMIT64: usize = 261;
+    pub const SYS_GETRANDOM: usize = 278;
+    pub const SYS_READLINKAT: usize = 78;
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -65,6 +82,8 @@ const O_EXCL: u32 = 0o200;
 
 /// Program break for minimal `brk` emulation.
 static PROGRAM_BRK: AtomicUsize = AtomicUsize::new(0x0300_0000);
+static PROGRAM_BRK_MAPPED: AtomicUsize = AtomicUsize::new(0x0300_0000);
+static NEXT_MMAP_ADDR: AtomicUsize = AtomicUsize::new(0x1000_0000);
 
 static FD_TABLE: Mutex<Vec<Option<File>>> = Mutex::new(Vec::new());
 
@@ -72,6 +91,28 @@ static FD_TABLE: Mutex<Vec<Option<File>>> = Mutex::new(Vec::new());
 struct IoVec {
     iov_base: usize,
     iov_len: usize,
+}
+
+#[repr(C)]
+struct UtsName {
+    sysname: [u8; 65],
+    nodename: [u8; 65],
+    release: [u8; 65],
+    version: [u8; 65],
+    machine: [u8; 65],
+    domainname: [u8; 65],
+}
+
+#[repr(C)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+#[repr(C)]
+struct Rlimit {
+    rlim_cur: u64,
+    rlim_max: u64,
 }
 
 bitflags::bitflags! {
@@ -351,22 +392,235 @@ fn sys_brk(addr: usize) -> isize {
     if addr == 0 {
         return cur as isize;
     }
-    if addr < cur {
-        return neg_errno(LinuxError::ENOMEM);
+    let mapped_end = PROGRAM_BRK_MAPPED.load(Ordering::Relaxed);
+    let new_mapped_end = (addr + PAGE_SIZE_4K - 1) & !(PAGE_SIZE_4K - 1);
+    if new_mapped_end > mapped_end {
+        let aspace_guard = crate::USER_ASPACE.lock();
+        let Some(shared) = aspace_guard.as_ref() else {
+            return neg_errno(LinuxError::EFAULT);
+        };
+        let mut aspace = shared.lock();
+        if let Err(e) = aspace.map_alloc(
+            VirtAddr::from(mapped_end),
+            new_mapped_end - mapped_end,
+            MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
+            true,
+        ) {
+            return neg_errno(LinuxError::from(e));
+        }
+        PROGRAM_BRK_MAPPED.store(new_mapped_end, Ordering::Relaxed);
     }
     PROGRAM_BRK.store(addr, Ordering::Relaxed);
     addr as isize
 }
 
 fn sys_mmap(
-    _addr: *mut c_void,
-    _length: usize,
-    _prot: i32,
-    _flags: i32,
-    _fd: i32,
-    _offset: isize,
+    addr: *mut c_void,
+    length: usize,
+    prot: i32,
+    flags: i32,
+    fd: i32,
+    offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    if length == 0 || offset < 0 || offset as usize % PAGE_SIZE_4K != 0 {
+        return neg_errno(LinuxError::EINVAL);
+    }
+
+    let prot = match MmapProt::from_bits(prot) {
+        Some(bits) => bits,
+        None => return neg_errno(LinuxError::EINVAL),
+    };
+    let flags = match MmapFlags::from_bits(flags) {
+        Some(bits) => bits,
+        None => return neg_errno(LinuxError::EINVAL),
+    };
+    if !flags.intersects(MmapFlags::MAP_SHARED | MmapFlags::MAP_PRIVATE) {
+        return neg_errno(LinuxError::EINVAL);
+    }
+
+    let map_len = (length + PAGE_SIZE_4K - 1) & !(PAGE_SIZE_4K - 1);
+    let map_flags = MappingFlags::from(prot);
+
+    let aspace_guard = crate::USER_ASPACE.lock();
+    let Some(shared) = aspace_guard.as_ref() else {
+        return neg_errno(LinuxError::EFAULT);
+    };
+    let mut aspace = shared.lock();
+
+    let start = if flags.contains(MmapFlags::MAP_FIXED) {
+        let requested = addr as usize;
+        if requested == 0 || requested % PAGE_SIZE_4K != 0 {
+            return neg_errno(LinuxError::EINVAL);
+        }
+        VirtAddr::from(requested)
+    } else {
+        let hint = if addr.is_null() {
+            VirtAddr::from(NEXT_MMAP_ADDR.load(Ordering::Relaxed))
+        } else {
+            VirtAddr::from((addr as usize) & !(PAGE_SIZE_4K - 1))
+        };
+        let limit = VirtAddrRange::from_start_size(aspace.base(), aspace.size());
+        match aspace.find_free_area(hint, map_len, limit) {
+            Some(vaddr) => vaddr,
+            None => return neg_errno(LinuxError::ENOMEM),
+        }
+    };
+
+    if let Err(e) = aspace.map_alloc(start, map_len, map_flags, true) {
+        return neg_errno(LinuxError::from(e));
+    }
+
+    if !flags.contains(MmapFlags::MAP_ANONYMOUS) {
+        let mut file_buf = Vec::new();
+        file_buf.resize(length, 0);
+        let read_res = with_file_fd(fd, |file| {
+            file.read_at(offset as u64, &mut file_buf)
+                .map_err(LinuxError::from)
+        });
+        match read_res {
+            Ok(_n) => {
+                if let Err(e) = aspace.write(start, &file_buf) {
+                    let _ = aspace.unmap(start, map_len);
+                    return neg_errno(LinuxError::from(e));
+                }
+            }
+            Err(e) => {
+                let _ = aspace.unmap(start, map_len);
+                return neg_errno(e);
+            }
+        }
+    }
+
+    NEXT_MMAP_ADDR.store(start.as_usize() + map_len, Ordering::Relaxed);
+    start.as_usize() as isize
+}
+
+fn write_user_buf(addr: usize, buf: &[u8]) -> isize {
+    let aspace_guard = crate::USER_ASPACE.lock();
+    let Some(shared) = aspace_guard.as_ref() else {
+        return neg_errno(LinuxError::EFAULT);
+    };
+    let aspace = shared.lock();
+    match aspace.write(VirtAddr::from(addr), buf) {
+        Ok(()) => 0,
+        Err(e) => neg_errno(LinuxError::from(e)),
+    }
+}
+
+fn write_c_field(dst: &mut [u8; 65], value: &str) {
+    let bytes = value.as_bytes();
+    let len = bytes.len().min(64);
+    dst[..len].copy_from_slice(&bytes[..len]);
+    dst[len] = 0;
+}
+
+fn sys_uname(buf: *mut c_void) -> isize {
+    if buf.is_null() {
+        return neg_errno(LinuxError::EFAULT);
+    }
+    let mut uts = UtsName {
+        sysname: [0; 65],
+        nodename: [0; 65],
+        release: [0; 65],
+        version: [0; 65],
+        machine: [0; 65],
+        domainname: [0; 65],
+    };
+    write_c_field(&mut uts.sysname, "Linux");
+    write_c_field(&mut uts.nodename, "arceos");
+    write_c_field(&mut uts.release, "6.1.0");
+    write_c_field(&mut uts.version, "ArceOS");
+    write_c_field(&mut uts.domainname, "localdomain");
+    #[cfg(target_arch = "riscv64")]
+    write_c_field(&mut uts.machine, "riscv64");
+    #[cfg(target_arch = "aarch64")]
+    write_c_field(&mut uts.machine, "aarch64");
+    #[cfg(target_arch = "loongarch64")]
+    write_c_field(&mut uts.machine, "loongarch64");
+    #[cfg(target_arch = "x86_64")]
+    write_c_field(&mut uts.machine, "x86_64");
+
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&uts as *const UtsName).cast::<u8>(),
+            core::mem::size_of::<UtsName>(),
+        )
+    };
+    write_user_buf(buf as usize, bytes)
+}
+
+fn sys_clock_gettime(_clockid: usize, tp: *mut c_void) -> isize {
+    if tp.is_null() {
+        return neg_errno(LinuxError::EFAULT);
+    }
+    let ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&ts as *const Timespec).cast::<u8>(),
+            core::mem::size_of::<Timespec>(),
+        )
+    };
+    write_user_buf(tp as usize, bytes)
+}
+
+fn sys_mprotect(addr: usize, len: usize, prot: i32) -> isize {
+    if addr % PAGE_SIZE_4K != 0 || len == 0 {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    let prot = match MmapProt::from_bits(prot) {
+        Some(bits) => bits,
+        None => return neg_errno(LinuxError::EINVAL),
+    };
+    let len = (len + PAGE_SIZE_4K - 1) & !(PAGE_SIZE_4K - 1);
+    let aspace_guard = crate::USER_ASPACE.lock();
+    let Some(shared) = aspace_guard.as_ref() else {
+        return neg_errno(LinuxError::EFAULT);
+    };
+    let mut aspace = shared.lock();
+    match aspace.protect(VirtAddr::from(addr), len, MappingFlags::from(prot)) {
+        Ok(()) => 0,
+        Err(e) => neg_errno(LinuxError::from(e)),
+    }
+}
+
+fn sys_prlimit64(_pid: usize, _resource: usize, _new_limit: usize, old_limit: usize) -> isize {
+    if old_limit != 0 {
+        let lim = Rlimit {
+            rlim_cur: u64::MAX,
+            rlim_max: u64::MAX,
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&lim as *const Rlimit).cast::<u8>(),
+                core::mem::size_of::<Rlimit>(),
+            )
+        };
+        let ret = write_user_buf(old_limit, bytes);
+        if ret < 0 {
+            return ret;
+        }
+    }
+    0
+}
+
+fn sys_getrandom(buf: *mut c_void, len: usize, _flags: usize) -> isize {
+    if buf.is_null() {
+        return neg_errno(LinuxError::EFAULT);
+    }
+    let zeros = alloc::vec![0u8; len];
+    let ret = write_user_buf(buf as usize, &zeros);
+    if ret < 0 {
+        ret
+    } else {
+        len as isize
+    }
+}
+
+fn sys_readlinkat(_dirfd: i32, _path: *const c_char, _buf: *mut c_void, _bufsiz: usize) -> isize {
+    neg_errno(LinuxError::ENOENT)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -401,6 +655,31 @@ pub fn handle_syscall(uctx: &mut UserContext) -> Option<i32> {
             ax_println!("Ignore SYS_IOCTL");
             0
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        SYS_GETUID | SYS_GETEUID | SYS_GETGID | SYS_GETEGID => 0,
+        #[cfg(not(target_arch = "x86_64"))]
+        SYS_SET_ROBUST_LIST | SYS_RT_SIGACTION | SYS_RT_SIGPROCMASK | SYS_TGKILL => 0,
+        #[cfg(not(target_arch = "x86_64"))]
+        SYS_GETPID => 1,
+        #[cfg(not(target_arch = "x86_64"))]
+        SYS_GETTID => axtask::current().id().as_u64() as isize,
+        #[cfg(not(target_arch = "x86_64"))]
+        SYS_UNAME => sys_uname(args[0] as *mut c_void),
+        #[cfg(not(target_arch = "x86_64"))]
+        SYS_CLOCK_GETTIME => sys_clock_gettime(args[0], args[1] as *mut c_void),
+        #[cfg(not(target_arch = "x86_64"))]
+        SYS_MPROTECT => sys_mprotect(args[0], args[1], args[2] as i32),
+        #[cfg(not(target_arch = "x86_64"))]
+        SYS_PRLIMIT64 => sys_prlimit64(args[0], args[1], args[2], args[3]),
+        #[cfg(not(target_arch = "x86_64"))]
+        SYS_GETRANDOM => sys_getrandom(args[0] as *mut c_void, args[1], args[2]),
+        #[cfg(not(target_arch = "x86_64"))]
+        SYS_READLINKAT => sys_readlinkat(
+            args[0] as i32,
+            args[1] as *const c_char,
+            args[2] as *mut c_void,
+            args[3],
+        ),
         SYS_SET_TID_ADDRESS => axtask::current().id().as_u64() as isize,
         SYS_BRK => sys_brk(args[0]),
         #[cfg(target_arch = "x86_64")]

@@ -24,4 +24,7 @@ required-features = ["xtask"]
 axstd = { version = "=0.3.0-preview.1", features = ["defplat", "alloc"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 
+[patch.crates-io]
+axstd = { path = "./axstd" }
+
 [profile.release]
