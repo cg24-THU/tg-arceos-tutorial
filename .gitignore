@@ -4,3 +4,4 @@ target
 #Cargo.lock
 *.elf
 *.bin
+/task4/
